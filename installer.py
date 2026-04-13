@@ -79,12 +79,15 @@ def flash_recovery():
     except:
         sys.exit(1)
 
-
+def sideload_software():
+    try:
+        run(f"{ADB} -d sideload {DOWNLOADS}/software.zip")
+    except:
+        sys.exit(1)
 files = {
     "splash.img": "https://updates.simplephone.nl/builds/parts/splash.img",
     "recovery.img": "https://updates.simplephone.nl/builds/parts/recovery.img",
     "software.zip": "https://updates.simplephone.nl/builds/parts/software.zip",
-    "addons.zip": "https://updates.simplephone.nl/builds/parts/addons.zip"
 }
 
 ADB = os.path.join("apt", "adb")
@@ -92,18 +95,29 @@ FASTBOOT = os.path.join("apt", "fastboot")
 DOWNLOAD_DIR = "downloads"
 DOWNLOADS = os.path.join("downloads")
 
-if(input("Is this your first time running this software, or has it been a while since the last time? Please enter Y in order to update the files (Y/N) "))=="Y":
-    update_files()
-else:
-    print("Did not detect Y, so not updating / downloading files")
+choice = input("Please choose from one of the following options: \n1 Update Files before starting (enter 1) \n2 Start from the beginning (enter 2) \n3 My device is already in fastboot (enter 3) \n4 My device is already in recovery (enter 4)\nYour choice: ")
 
-check_adb()
-reboot_bootloader()
-# Sleeping 30 seconds to allow the device to boot into fastboot before checking
+if choice == "1":
+    update_files()
+    check_adb()
+    reboot_bootloader()
+elif choice == "2":
+    check_adb()
+    reboot_bootloader()
+elif choice == "4":
+    sideload_software()
+    sys.exit(1)
+else:
+    print("Invalid choice, exiting.")
+    sys.exit(1)
 print("Waiting for the device to boot into fastboot")
-time.sleep(30)
+if(input("Please press enter when the device screen is on but black")): 
+    print("Running fastboot commands now")
 check_fastboot()
 flash_recovery()
 
-if(input("Please now hold the volume up button (the one far away from the power button) and the power button until the boot logo appears, press enter when you are done ")):
-    print("You should now be in a recovery menu")
+input = input("Please now hold the volume up button (the one far away from the power button) and the power button. Immediatly let go when the boot logo appears, press enter when you are done with this process")
+print("Flashing complete! The device should now boot into a pink recovery screen")
+input = input("Please Factory Reset the device. Then select Apply Update -> Apply from ADB. Press enter when you are done with this process")
+sideload_software()
+print("Complete! Please now select Reboot System Now")
