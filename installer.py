@@ -116,8 +116,8 @@ if(input("Please press enter when the device screen is on but black")):
 check_fastboot()
 flash_recovery()
 
-input = input("Please now hold the volume up button (the one far away from the power button) and the power button. Immediatly let go when the boot logo appears, press enter when you are done with this process")
+enter = input("Please now hold the volume up button (the one far away from the power button) and the power button. Immediatly let go when the boot logo appears, press enter when you are done with this process")
 print("Flashing complete! The device should now boot into a pink recovery screen")
-input = input("Please Factory Reset the device. Then select Apply Update -> Apply from ADB. Press enter when you are done with this process")
+enter = input("Please Factory Reset the device. Then select Apply Update -> Apply from ADB. Press enter when you are done with this process")
 sideload_software()
 print("Complete! Please now select Reboot System Now")
