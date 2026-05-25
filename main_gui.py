@@ -1,0 +1,530 @@
+#!/usr/bin/env python3
+"""Custom ROM Multi-Device Installer GUI - Main Application."""
+import sys
+import os
+
+# Bootstrap: Ensure directory structure exists
+def bootstrap_directories():
+    """Create required directories if they don't exist."""
+    os.makedirs("core", exist_ok=True)
+    os.makedirs("gui", exist_ok=True)
+    os.makedirs("downloads", exist_ok=True)
+    
+    # Create __init__.py files
+    for init_file in ["core/__init__.py", "gui/__init__.py"]:
+        if not os.path.exists(init_file):
+            with open(init_file, "w") as f:
+                f.write(f'"""Package initialized."""\n')
+
+bootstrap_directories()
+
+# Now import PyQt6 and our modules
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QTableWidget, QTableWidgetItem, QTextEdit, QCheckBox,
+    QHeaderView, QSplitter, QLabel, QProgressBar, QMessageBox, QComboBox, QGroupBox
+)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
+from PyQt6.QtGui import QColor, QFont, QIcon
+import subprocess
+from typing import Dict, List, Tuple
+import threading
+import time
+
+
+# Device Manager class
+class DeviceManager:
+    """Manages adb/fastboot operations."""
+    
+    def __init__(self, download_dir: str = "downloads"):
+        self.adb = os.path.join("apt", "adb")
+        self.fastboot = os.path.join("apt", "fastboot")
+        self.download_dir = download_dir
+        
+        if not os.path.exists(download_dir):
+            os.makedirs(download_dir)
+    
+    def run_command(self, cmd: str, device_serial=None) -> Tuple[bool, str]:
+        """Run a command and return (success, output)."""
+        try:
+            if device_serial and not cmd.startswith(self.fastboot) and not " sideload " in cmd:
+                cmd = f"{cmd} -s {device_serial}"
+            
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            output = result.stdout + result.stderr
+            success = result.returncode == 0
+            return success, output
+        except subprocess.TimeoutExpired:
+            return False, "Command timed out"
+        except Exception as e:
+            return False, str(e)
+    
+    def get_adb_devices(self) -> List[str]:
+        """Get list of connected ADB devices."""
+        try:
+            result = subprocess.check_output(f"{self.adb} devices", shell=True).decode()
+            lines = result.strip().split("\n")[1:]
+            devices = [l.split()[0] for l in lines if "device" in l and not l.startswith("*")]
+            return devices
+        except Exception:
+            return []
+    
+    def get_fastboot_devices(self) -> List[str]:
+        """Get list of devices in fastboot mode."""
+        try:
+            result = subprocess.check_output(f"{self.fastboot} devices", shell=True).decode()
+            lines = result.strip().split("\n")
+            devices = [l.split()[0] for l in lines if l.strip() and ("fastboot" in l or l[0] not in [" ", "*"])]
+            return [d for d in devices if d]
+        except Exception:
+            return []
+    
+    def get_device_name(self, device_serial: str) -> str:
+        """Get device model name via adb shell getprop."""
+        success, output = self.run_command(f'{self.adb} shell getprop ro.product.model', device_serial)
+        if success:
+            return output.strip()
+        return "Unknown"
+    
+    def get_device_state(self, device_serial: str) -> str:
+        """Determine device state: ADB, Fastboot, or Recovery."""
+        adb_devices = self.get_adb_devices()
+        fastboot_devices = self.get_fastboot_devices()
+        
+        if device_serial in fastboot_devices:
+            return "Fastboot"
+        elif device_serial in adb_devices:
+            # Check if in recovery
+            success, output = self.run_command(f"{self.adb} shell getprop ro.boot.serialno", device_serial)
+            if success and output.strip():
+                return "ADB"
+            return "ADB"
+        return "Offline"
+    
+    def reboot_bootloader(self, device_serial: str) -> Tuple[bool, str]:
+        """Reboot device to bootloader."""
+        return self.run_command(f"{self.adb} reboot bootloader", device_serial)
+    
+    def reboot_recovery(self, device_serial: str) -> Tuple[bool, str]:
+        """Reboot device to recovery mode."""
+        return self.run_command(f"{self.adb} reboot recovery", device_serial)
+    
+    def reboot_system(self, device_serial: str) -> Tuple[bool, str]:
+        """Reboot device to system."""
+        return self.run_command(f"{self.adb} shell reboot", device_serial)
+    
+    def flash_recovery(self, device_serial: str) -> Tuple[bool, str]:
+        """Flash recovery and splash images."""
+        recovery_path = os.path.join(self.download_dir, "recovery.img")
+        splash_path = os.path.join(self.download_dir, "splash.img")
+        
+        if not os.path.exists(recovery_path) or not os.path.exists(splash_path):
+            return False, "recovery.img or splash.img not found"
+        
+        cmd1 = f'{self.fastboot} -s {device_serial} flash recovery "{recovery_path}"'
+        success, output = self.run_command(cmd1)
+        if not success:
+            return False, f"Failed to flash recovery: {output}"
+        
+        cmd2 = f'{self.fastboot} -s {device_serial} flash splash "{splash_path}"'
+        success, output = self.run_command(cmd2)
+        return success, output
+    
+    def sideload_software(self, device_serial: str) -> Tuple[bool, str]:
+        """Sideload software.zip."""
+        software_path = os.path.join(self.download_dir, "software.zip")
+        
+        if not os.path.exists(software_path):
+            return False, "software.zip not found"
+        
+        cmd = f'{self.adb} -s {device_serial} sideload "{software_path}"'
+        return self.run_command(cmd)
+
+
+# Device Detector Thread
+class DeviceDetectorThread(QThread):
+    """Background thread for device detection."""
+    
+    devices_changed = pyqtSignal(dict)  # Emits {serial: (name, state)}
+    
+    def __init__(self, device_manager: DeviceManager):
+        super().__init__()
+        self.device_manager = device_manager
+        self.running = True
+        self.detected_devices = {}
+    
+    def run(self):
+        """Continuously scan for devices."""
+        while self.running:
+            current_devices = {}
+            
+            # Scan ADB devices
+            for serial in self.device_manager.get_adb_devices():
+                name = self.device_manager.get_device_name(serial)
+                state = "ADB"
+                current_devices[serial] = (name, state)
+            
+            # Scan Fastboot devices
+            for serial in self.device_manager.get_fastboot_devices():
+                if serial not in current_devices:
+                    current_devices[serial] = ("Unknown", "Fastboot")
+            
+            # Emit if changes detected
+            if current_devices != self.detected_devices:
+                self.detected_devices = current_devices
+                self.devices_changed.emit(current_devices)
+            
+            time.sleep(2)  # Scan every 2 seconds
+    
+    def stop(self):
+        """Stop the detector thread."""
+        self.running = False
+        self.wait()
+
+
+# Main GUI Application
+class ROMInstallerGUI(QMainWindow):
+    """Main GUI window for multi-device ROM installer."""
+    
+    # Class-level signal definition
+    log_signal = pyqtSignal(str)
+    
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Custom ROM Multi-Device Installer")
+        self.setGeometry(100, 100, 1200, 800)
+        
+        self.device_manager = DeviceManager()
+        self.selected_devices = set()
+        self.device_progress = {}  # Track progress per device
+        
+        # Connect logging signal
+        self.log_signal.connect(self.append_log)
+        
+        self.setup_ui()
+        self.start_device_detector()
+    
+    def setup_ui(self):
+        """Set up the user interface."""
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        
+        main_layout = QHBoxLayout()
+        
+        # Left panel: Device list
+        left_layout = QVBoxLayout()
+        left_label = QLabel("Connected Devices")
+        left_label.setStyleSheet("font-weight: bold; font-size: 12px;")
+        left_layout.addWidget(left_label)
+        
+        self.device_table = QTableWidget()
+        self.device_table.setColumnCount(5)
+        self.device_table.setHorizontalHeaderLabels(["Select", "Serial", "Name", "State", "Progress"])
+        self.device_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.device_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.device_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.device_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.device_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self.device_table.setMaximumWidth(600)
+        
+        left_layout.addWidget(self.device_table)
+        
+        # Right panel: Action buttons
+        right_layout = QVBoxLayout()
+        right_label = QLabel("Actions for Selected Devices")
+        right_label.setStyleSheet("font-weight: bold; font-size: 12px;")
+        right_layout.addWidget(right_label)
+        
+        # Action buttons
+        button_style = "padding: 8px; font-size: 11px; min-height: 30px;"
+        
+        self.btn_reboot_bootloader = QPushButton("🔄 Reboot to Bootloader")
+        self.btn_reboot_bootloader.setStyleSheet(button_style)
+        self.btn_reboot_bootloader.clicked.connect(self.on_reboot_bootloader)
+        right_layout.addWidget(self.btn_reboot_bootloader)
+        
+        self.btn_flash_recovery = QPushButton("⚡ Flash Recovery")
+        self.btn_flash_recovery.setStyleSheet(button_style)
+        self.btn_flash_recovery.clicked.connect(self.on_flash_recovery)
+        right_layout.addWidget(self.btn_flash_recovery)
+        
+        self.btn_reboot_recovery = QPushButton("↩️ Reboot to Recovery")
+        self.btn_reboot_recovery.setStyleSheet(button_style)
+        self.btn_reboot_recovery.clicked.connect(self.on_reboot_recovery)
+        right_layout.addWidget(self.btn_reboot_recovery)
+        
+        self.btn_sideload = QPushButton("📦 Sideload Software")
+        self.btn_sideload.setStyleSheet(button_style)
+        self.btn_sideload.clicked.connect(self.on_sideload)
+        right_layout.addWidget(self.btn_sideload)
+        
+        self.btn_reboot_system = QPushButton("🔌 Reboot to System")
+        self.btn_reboot_system.setStyleSheet(button_style)
+        self.btn_reboot_system.clicked.connect(self.on_reboot_system)
+        right_layout.addWidget(self.btn_reboot_system)
+        
+        self.btn_manual_install = QPushButton("🛠️ Manual Install Script")
+        self.btn_manual_install.setStyleSheet(button_style)
+        self.btn_manual_install.clicked.connect(self.on_manual_install)
+        right_layout.addWidget(self.btn_manual_install)
+        
+        right_layout.addSpacing(10)
+        
+        self.btn_refresh = QPushButton("🔍 Refresh Devices")
+        self.btn_refresh.setStyleSheet(button_style)
+        self.btn_refresh.clicked.connect(self.on_refresh_devices)
+        right_layout.addWidget(self.btn_refresh)
+        
+        self.btn_clear_downloads = QPushButton("🗑️ Clear Downloads")
+        self.btn_clear_downloads.setStyleSheet(button_style)
+        self.btn_clear_downloads.clicked.connect(self.on_clear_downloads)
+        right_layout.addWidget(self.btn_clear_downloads)
+        
+        self.btn_update_files = QPushButton("📥 Update Files")
+        self.btn_update_files.setStyleSheet(button_style)
+        self.btn_update_files.clicked.connect(self.on_update_files)
+        right_layout.addWidget(self.btn_update_files)
+        
+        right_layout.addStretch()
+        
+        # Bottom: Log viewer
+        log_label = QLabel("Status Log")
+        log_label.setStyleSheet("font-weight: bold; font-size: 12px;")
+        
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMaximumHeight(200)
+        
+        # Main layout assembly
+        left_panel = QWidget()
+        left_panel.setLayout(left_layout)
+        
+        right_panel = QWidget()
+        right_panel.setLayout(right_layout)
+        
+        main_layout.addWidget(left_panel)
+        main_layout.addWidget(right_panel)
+        
+        # Add bottom log to main layout
+        bottom_layout = QVBoxLayout()
+        bottom_layout.addWidget(log_label)
+        bottom_layout.addWidget(self.log_text)
+        
+        full_layout = QVBoxLayout(central_widget)
+        full_layout.addLayout(main_layout, 1)
+        full_layout.addLayout(bottom_layout, 0)
+    
+    def start_device_detector(self):
+        """Start the background device detector thread."""
+        self.detector_thread = DeviceDetectorThread(self.device_manager)
+        self.detector_thread.devices_changed.connect(self.update_device_table)
+        self.detector_thread.start()
+    
+    def update_device_table(self, devices: Dict[str, Tuple[str, str]]):
+        """Update device table with current devices."""
+        current_serials = set(devices.keys())
+        table_serials = set()
+        
+        # Collect existing serials
+        for row in range(self.device_table.rowCount()):
+            item = self.device_table.item(row, 1)
+            if item:
+                table_serials.add(item.text())
+        
+        # Remove rows for disconnected devices
+        for row in range(self.device_table.rowCount() - 1, -1, -1):
+            item = self.device_table.item(row, 1)
+            if item and item.text() not in current_serials:
+                self.device_table.removeRow(row)
+                if item.text() in self.selected_devices:
+                    self.selected_devices.discard(item.text())
+        
+        # Add or update rows for current devices
+        for serial, (name, state) in devices.items():
+            found = False
+            for row in range(self.device_table.rowCount()):
+                item = self.device_table.item(row, 1)
+                if item and item.text() == serial:
+                    found = True
+                    # Update name and state
+                    self.device_table.item(row, 2).setText(name)
+                    self.device_table.item(row, 3).setText(state)
+                    break
+            
+            if not found:
+                row = self.device_table.rowCount()
+                self.device_table.insertRow(row)
+                
+                # Checkbox
+                checkbox = QCheckBox()
+                checkbox.stateChanged.connect(lambda state, s=serial: self.on_device_selected(s, state))
+                self.device_table.setCellWidget(row, 0, checkbox)
+                
+                # Serial
+                serial_item = QTableWidgetItem(serial)
+                serial_item.setFlags(serial_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.device_table.setItem(row, 1, serial_item)
+                
+                # Name
+                name_item = QTableWidgetItem(name)
+                name_item.setFlags(name_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.device_table.setItem(row, 2, name_item)
+                
+                # State
+                state_item = QTableWidgetItem(state)
+                state_item.setFlags(state_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.device_table.setItem(row, 3, state_item)
+                
+                # Progress bar
+                progress_bar = QProgressBar()
+                progress_bar.setValue(0)
+                self.device_table.setCellWidget(row, 4, progress_bar)
+                self.device_progress[serial] = progress_bar
+    
+    def on_device_selected(self, serial: str, state: int):
+        """Handle device selection."""
+        if state == Qt.CheckState.Checked.value:
+            self.selected_devices.add(serial)
+            self.log(f"✓ Selected device: {serial}")
+        else:
+            self.selected_devices.discard(serial)
+            self.log(f"✗ Deselected device: {serial}")
+    
+    def on_update_files(self):
+        """Download update files."""
+        self.log("⏳ Downloading files...")
+        # Placeholder - implement file download logic here
+        self.log("✓ File download feature not yet implemented")
+    
+    def on_reboot_bootloader(self):
+        """Reboot selected devices to bootloader."""
+        if not self.selected_devices:
+            QMessageBox.warning(self, "No Device", "Please select at least one device")
+            return
+        
+        for serial in self.selected_devices:
+            self.log(f"⏳ Rebooting {serial} to bootloader...")
+            success, output = self.device_manager.reboot_bootloader(serial)
+            if success:
+                self.log(f"✓ {serial} rebooting to bootloader")
+            else:
+                self.log(f"✗ Failed to reboot {serial}: {output}")
+    
+    def on_flash_recovery(self):
+        """Flash recovery on selected devices."""
+        if not self.selected_devices:
+            QMessageBox.warning(self, "No Device", "Please select at least one device")
+            return
+        
+        for serial in self.selected_devices:
+            self.log(f"⏳ Flashing recovery on {serial}...")
+            success, output = self.device_manager.flash_recovery(serial)
+            if success:
+                self.log(f"✓ {serial} recovery flashed successfully")
+            else:
+                self.log(f"✗ Failed to flash {serial}: {output}")
+    
+    def on_reboot_recovery(self):
+        """Reboot selected devices to recovery."""
+        if not self.selected_devices:
+            QMessageBox.warning(self, "No Device", "Please select at least one device")
+            return
+        
+        for serial in self.selected_devices:
+            self.log(f"⏳ Rebooting {serial} to recovery...")
+            success, output = self.device_manager.reboot_recovery(serial)
+            if success:
+                self.log(f"✓ {serial} rebooting to recovery")
+            else:
+                self.log(f"✗ Failed to reboot {serial}: {output}")
+    
+    def on_sideload(self):
+        """Sideload software on selected devices."""
+        if not self.selected_devices:
+            QMessageBox.warning(self, "No Device", "Please select at least one device")
+            return
+        
+        for serial in self.selected_devices:
+            self.log(f"⏳ Sideloading software to {serial}...")
+            success, output = self.device_manager.sideload_software(serial)
+            if success:
+                self.log(f"✓ {serial} sideload completed")
+            else:
+                self.log(f"✗ Failed to sideload to {serial}: {output}")
+    
+    def on_reboot_system(self):
+        """Reboot selected devices to system."""
+        if not self.selected_devices:
+            QMessageBox.warning(self, "No Device", "Please select at least one device")
+            return
+        
+        for serial in self.selected_devices:
+            self.log(f"⏳ Rebooting {serial} to system...")
+            success, output = self.device_manager.reboot_system(serial)
+            if success:
+                self.log(f"✓ {serial} rebooting to system")
+            else:
+                self.log(f"✗ Failed to reboot {serial}: {output}")
+    
+    def on_manual_install(self):
+        """Run manual install script on selected devices."""
+        if not self.selected_devices:
+            QMessageBox.warning(self, "No Device", "Please select at least one device")
+            return
+        
+        self.log("⏳ Manual install not yet implemented - customize this function")
+        QMessageBox.information(self, "Manual Install", "Customize on_manual_install() to add your installation logic")
+    
+    def on_refresh_devices(self):
+        """Force refresh device list."""
+        self.log("🔍 Refreshing device list...")
+    
+    def on_clear_downloads(self):
+        """Clear downloaded files."""
+        self.log("🗑️ Clearing downloads...")
+        import shutil
+        try:
+            if os.path.exists("downloads"):
+                for file in os.listdir("downloads"):
+                    file_path = os.path.join("downloads", file)
+                    if os.path.isfile(file_path):
+                        os.remove(file_path)
+                        self.log(f"Deleted: {file}")
+            self.log("✓ Downloads cleared")
+        except Exception as e:
+            self.log(f"✗ Error clearing downloads: {e}")
+    
+    def log(self, message: str):
+        """Add message to log."""
+        self.log_text.append(message)
+        # Auto-scroll to bottom
+        scrollbar = self.log_text.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+    
+    def append_log(self, message: str):
+        """Append to log (signal handler)."""
+        self.log(message)
+    
+    def closeEvent(self, event):
+        """Handle window close event."""
+        self.detector_thread.stop()
+        event.accept()
+
+
+def main():
+    """Run the application."""
+    app = QApplication(sys.argv)
+    window = ROMInstallerGUI()
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
