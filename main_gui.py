@@ -22,7 +22,8 @@ bootstrap_directories()
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTableWidget, QTableWidgetItem, QTextEdit, QCheckBox,
-    QHeaderView, QSplitter, QLabel, QProgressBar, QMessageBox, QComboBox, QGroupBox
+    QHeaderView, QSplitter, QLabel, QProgressBar, QMessageBox, QComboBox, QGroupBox,
+    QDialog, QLineEdit
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
 from PyQt6.QtGui import QColor, QFont, QIcon
@@ -354,6 +355,151 @@ class SideloadWorker(QThread):
         self.finished_op.emit(self.serial, success, output)
 
 
+# CLI Dialog
+class CLIDialog(QDialog):
+    """Dialog for executing custom CLI commands with adb/fastboot."""
+    
+    def __init__(self, parent=None, device_manager: DeviceManager = None):
+        super().__init__(parent)
+        self.device_manager = device_manager
+        self.setWindowTitle("Custom CLI")
+        self.setGeometry(200, 200, 900, 600)
+        self.setup_ui()
+    
+    def setup_ui(self):
+        """Set up the CLI dialog interface."""
+        layout = QVBoxLayout()
+        
+        # Title
+        title = QLabel("Custom CLI Commands")
+        title_font = QFont()
+        title_font.setBold(True)
+        title_font.setPointSize(12)
+        title.setFont(title_font)
+        layout.addWidget(title)
+        
+        # Info text
+        info = QLabel("Enter custom adb or fastboot commands. Use 'adb' or 'fastboot' keywords directly.")
+        layout.addWidget(info)
+        
+        # Command input
+        input_layout = QHBoxLayout()
+        input_label = QLabel("Command:")
+        self.command_input = QLineEdit()
+        self.command_input.setPlaceholderText("e.g., adb logcat | e.g., fastboot devices | e.g., adb shell pm list packages")
+        self.command_input.returnPressed.connect(self.execute_command)
+        input_layout.addWidget(input_label)
+        input_layout.addWidget(self.command_input)
+        layout.addLayout(input_layout)
+        
+        # Device selection
+        device_layout = QHBoxLayout()
+        device_label = QLabel("Device (optional for adb):")
+        self.device_combo = QComboBox()
+        self.device_combo.addItem("All/None")
+        device_layout.addWidget(device_label)
+        device_layout.addWidget(self.device_combo)
+        layout.addLayout(device_layout)
+        
+        # Output area
+        output_label = QLabel("Output:")
+        layout.addWidget(output_label)
+        
+        self.output_text = QTextEdit()
+        self.output_text.setReadOnly(True)
+        self.output_text.setStyleSheet("background-color: #1e1e1e; color: #00ff00; font-family: Courier; font-size: 10px;")
+        layout.addWidget(self.output_text)
+        
+        # Buttons layout
+        button_layout = QHBoxLayout()
+        
+        self.execute_btn = QPushButton("Execute")
+        self.execute_btn.clicked.connect(self.execute_command)
+        button_layout.addWidget(self.execute_btn)
+        
+        self.clear_btn = QPushButton("Clear Output")
+        self.clear_btn.clicked.connect(self.output_text.clear)
+        button_layout.addWidget(self.clear_btn)
+        
+        button_layout.addStretch()
+        
+        self.close_btn = QPushButton("Close")
+        self.close_btn.clicked.connect(self.accept)
+        button_layout.addWidget(self.close_btn)
+        
+        layout.addLayout(button_layout)
+        
+        self.setLayout(layout)
+        self.refresh_device_list()
+    
+    def refresh_device_list(self):
+        """Refresh the device combo box."""
+        if not self.device_manager:
+            return
+        
+        current_text = self.device_combo.currentText()
+        self.device_combo.clear()
+        self.device_combo.addItem("All/None")
+        
+        devices = self.device_manager.get_adb_devices()
+        for device in devices:
+            device_name = self.device_manager.get_device_name(device)
+            display_text = f"{device} ({device_name})"
+            self.device_combo.addItem(display_text, device)
+        
+        # Restore previous selection
+        idx = self.device_combo.findText(current_text)
+        if idx >= 0:
+            self.device_combo.setCurrentIndex(idx)
+    
+    def execute_command(self):
+        """Execute the entered command."""
+        command = self.command_input.text().strip()
+        if not command:
+            self.output_text.append("⚠️ Please enter a command")
+            return
+        
+        device_text = self.device_combo.currentData()
+        
+        self.output_text.append(f"\n$ {command}\n{'='*80}")
+        
+        try:
+            # Replace keywords with full paths
+            if command.startswith("adb "):
+                command = command.replace("adb ", f"{self.device_manager.adb} ", 1)
+                if device_text and device_text != "All/None":
+                    command = command.replace(f"{self.device_manager.adb} ", f"{self.device_manager.adb} -s {device_text} ", 1)
+            elif command.startswith("fastboot "):
+                command = command.replace("fastboot ", f"{self.device_manager.fastboot} ", 1)
+                if device_text and device_text != "All/None":
+                    command = command.replace(f"{self.device_manager.fastboot} ", f"{self.device_manager.fastboot} -s {device_text} ", 1)
+            
+            result = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            
+            output = result.stdout
+            if result.stderr:
+                output += result.stderr
+            
+            if result.returncode == 0:
+                self.output_text.append(output if output else "✓ Command executed successfully")
+            else:
+                self.output_text.append(f"❌ Command failed (exit code: {result.returncode})\n{output if output else 'No output'}")
+        
+        except subprocess.TimeoutExpired:
+            self.output_text.append("❌ Command timed out (60s)")
+        except Exception as e:
+            self.output_text.append(f"❌ Error: {str(e)}")
+        
+        self.output_text.append("="*80)
+        self.output_text.verticalScrollBar().setValue(self.output_text.verticalScrollBar().maximum())
+
+
 # Main GUI Application
 class ROMInstallerGUI(QMainWindow):
     """Main GUI window for multi-device ROM installer."""
@@ -389,6 +535,7 @@ class ROMInstallerGUI(QMainWindow):
         left_layout = QVBoxLayout()
         left_label = QLabel("Connected Devices")
         left_label.setStyleSheet("font-weight: bold; font-size: 12px;")
+        left_label.mouseDoubleClickEvent = lambda event: self.toggle_cli_button()
         left_layout.addWidget(left_label)
         
         self.device_table = QTableWidget()
@@ -459,6 +606,13 @@ class ROMInstallerGUI(QMainWindow):
         self.btn_update_files.clicked.connect(self.on_update_files)
         self.btn_update_files.setMaximumWidth(220)
         right_layout.addWidget(self.btn_update_files)
+        
+        # CLI button
+        self.btn_cli = QPushButton("⚙️ Custom CLI")
+        self.btn_cli.setStyleSheet(button_style)
+        self.btn_cli.clicked.connect(self.on_open_cli)
+        self.btn_cli.setMaximumWidth(220)
+        right_layout.addWidget(self.btn_cli)
         
         right_layout.addStretch()
         
@@ -728,6 +882,11 @@ class ROMInstallerGUI(QMainWindow):
     def on_refresh_devices(self):
         """Force refresh device list."""
         self.log("🔍 Refreshing device list...")
+    
+    def on_update_files(self):
+        """Update/download files (placeholder for custom implementation)."""
+        self.log("📥 Update files functionality can be customized here")
+        QMessageBox.information(self, "Update Files", "Customize on_update_files() to add your file download/update logic")
 
     def on_clear_downloads(self):
         """Clear downloaded files."""
@@ -754,6 +913,15 @@ class ROMInstallerGUI(QMainWindow):
     def append_log(self, message: str):
         """Append to log (signal handler)."""
         self.log(message)
+
+    def toggle_cli_button(self):
+       """Toggle CLI button visibility (double-click on title)."""
+       self.btn_cli.setVisible(not self.btn_cli.isVisible())
+    
+    def on_open_cli(self):
+       """Open the custom CLI dialog."""
+       cli_dialog = CLIDialog(self, self.device_manager)
+       cli_dialog.exec()
 
     def closeEvent(self, event):
         """Handle window close event."""
