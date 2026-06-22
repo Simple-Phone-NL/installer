@@ -355,6 +355,40 @@ class SideloadWorker(QThread):
         self.finished_op.emit(self.serial, success, output)
 
 
+# Command worker for streaming subprocess output
+class CommandWorker(QThread):
+    """Run a shell command in a background thread and stream stdout lines via signal."""
+    output_line = pyqtSignal(str)
+    finished = pyqtSignal(int)
+
+    def __init__(self, command: str):
+        super().__init__()
+        self.command = command
+        self._proc = None
+
+    def run(self):
+        try:
+            # Start process and stream lines as they arrive
+            self._proc = subprocess.Popen(
+                self.command,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1
+            )
+            if self._proc.stdout is not None:
+                for line in self._proc.stdout:
+                    # Emit each line to be appended by the GUI
+                    self.output_line.emit(line.rstrip("\n"))
+            self._proc.wait()
+            code = self._proc.returncode if self._proc.returncode is not None else -1
+            self.finished.emit(code)
+        except Exception as e:
+            self.output_line.emit(f"❌ Error: {e}")
+            self.finished.emit(-1)
+
+
 # CLI Dialog
 class CLIDialog(QDialog):
     """Dialog for executing custom CLI commands with adb/fastboot."""
@@ -453,51 +487,54 @@ class CLIDialog(QDialog):
             self.device_combo.setCurrentIndex(idx)
     
     def execute_command(self):
-        """Execute the entered command."""
+        """Execute the entered command asynchronously and stream output."""
         command = self.command_input.text().strip()
         if not command:
             self.output_text.append("⚠️ Please enter a command")
             return
-        
+
         device_text = self.device_combo.currentData()
-        
+
         self.output_text.append(f"\n$ {command}\n{'='*80}")
-        
-        try:
-            # Replace keywords with full paths
-            if command.startswith("adb "):
-                command = command.replace("adb ", f"{self.device_manager.adb} ", 1)
-                if device_text and device_text != "All/None":
-                    command = command.replace(f"{self.device_manager.adb} ", f"{self.device_manager.adb} -s {device_text} ", 1)
-            elif command.startswith("fastboot "):
-                command = command.replace("fastboot ", f"{self.device_manager.fastboot} ", 1)
-                if device_text and device_text != "All/None":
-                    command = command.replace(f"{self.device_manager.fastboot} ", f"{self.device_manager.fastboot} -s {device_text} ", 1)
-            
-            result = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=60
-            )
-            
-            output = result.stdout
-            if result.stderr:
-                output += result.stderr
-            
-            if result.returncode == 0:
-                self.output_text.append(output if output else "✓ Command executed successfully")
-            else:
-                self.output_text.append(f"❌ Command failed (exit code: {result.returncode})\n{output if output else 'No output'}")
-        
-        except subprocess.TimeoutExpired:
-            self.output_text.append("❌ Command timed out (60s)")
-        except Exception as e:
-            self.output_text.append(f"❌ Error: {str(e)}")
-        
+
+        # Replace keywords with full paths
+        if command.startswith("adb "):
+            command = command.replace("adb ", f"{self.device_manager.adb} ", 1)
+            if device_text:
+                command = command.replace(f"{self.device_manager.adb} ", f"{self.device_manager.adb} -s {device_text} ", 1)
+        elif command.startswith("fastboot "):
+            command = command.replace("fastboot ", f"{self.device_manager.fastboot} ", 1)
+            if device_text:
+                command = command.replace(f"{self.device_manager.fastboot} ", f"{self.device_manager.fastboot} -s {device_text} ", 1)
+
+        # Prevent multiple concurrent executions
+        if hasattr(self, 'cmd_worker') and getattr(self, 'cmd_worker') is not None:
+            self.output_text.append("⚠️ A command is already running")
+            return
+
+        # Disable controls while running
+        self.execute_btn.setEnabled(False)
+        self.command_input.setEnabled(False)
+
+        # Start background worker to stream output
+        self.cmd_worker = CommandWorker(command)
+        self.cmd_worker.output_line.connect(lambda line: self.output_text.append(line))
+        self.cmd_worker.finished.connect(self._on_command_finished)
+        self.cmd_worker.start()
+
+    def _on_command_finished(self, code: int):
+        if code == 0:
+            self.output_text.append("✓ Command finished (exit code 0)")
+        else:
+            self.output_text.append(f"❌ Command finished (exit code {code})")
         self.output_text.append("="*80)
+        # Re-enable controls
+        self.execute_btn.setEnabled(True)
+        self.command_input.setEnabled(True)
+        # Scroll to bottom
         self.output_text.verticalScrollBar().setValue(self.output_text.verticalScrollBar().maximum())
+        # Clear worker
+        self.cmd_worker = None
 
 
 # Main GUI Application
